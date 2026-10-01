@@ -1,14 +1,7 @@
-# secrets
 .env
-.env.*
-!.env.example
-
-# python
-__pycache__/
-*.pyc
-venv/
-.DS_Store
-
-# data
 vectorstore/
-*.pdf
+model_cache/
+temp_*.pdf
+__pycache__/
+venv/
+.venv/

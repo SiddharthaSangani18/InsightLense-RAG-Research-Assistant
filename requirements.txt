@@ -7,10 +7,9 @@ langchain
 langchain-community
 langchain-core
 langchain-groq
-langchain-huggingface
+langchain-classic
 faiss-cpu
-sentence-transformers
+fastembed
 llama-parse
 pymupdf
 rank_bm25
-langchain-classic

@@ -516,14 +516,74 @@
                     this.elements.uploadZone.innerHTML = originalText;
                 }
             }
+             async resetSession() {
+    if (!confirm("Are you sure? Chat history will be deleted.")) return;
 
-            async resetSession() {
-                if(!confirm("Are you sure? Chat history will be deleted.")) return;
-                
-                await fetch('/reset-session', { method: 'POST' });
-                location.reload();
-            }
+    try {
+        const res = await fetch('/reset-session', {
+            method: 'POST'
+        });
 
+        const data = await res.json();
+
+        if (!data.success) {
+            alert("Could not reset the document: " + (data.error || "Unknown error"));
+            return;
+        }
+
+        // Clear file input
+        this.elements.pdfInput.value = "";
+
+        // Clear previous chat
+        this.elements.chatMessages.innerHTML = `
+            <div class="message ai">
+                <span class="msg-label">AI Assistant</span>
+                <div class="msg-bubble">
+                    Upload a new PDF to start analyzing.
+                </div>
+            </div>
+        `;
+
+        // Show upload screen
+        this.elements.uploadSection.style.display = 'flex';
+
+        // Hide chat screen
+        this.elements.chatSection.style.display = 'none';
+
+        // Hide old PDF card
+        this.elements.pdfIndicator.classList.remove('visible');
+
+        // Reset document name
+        this.elements.pdfName.textContent = "document.pdf";
+
+        // Reset page heading
+        this.elements.pageTitle.textContent = "Document Center";
+        this.elements.pageSubtitle.textContent = "Upload a PDF to start analyzing";
+
+        // Reset upload box
+        this.elements.uploadZone.innerHTML = `
+            <div class="upload-icon-large">☁️</div>
+            <h3>Upload Document</h3>
+            <p style="color: var(--text-muted); margin-top: 8px;">
+                Drag & drop your PDF here or click to browse
+            </p>
+            <input type="file" id="pdfInput" class="hidden-input" accept=".pdf">
+        `;
+
+        // Reconnect the newly created file input
+        this.elements.pdfInput =
+            document.getElementById('pdfInput');
+
+        this.elements.pdfInput.addEventListener('change', (e) => {
+            this.handleUpload(e.target.files[0]);
+        });
+
+    } catch (error) {
+        console.error("Reset error:", error);
+        alert("Could not reset the document. Check the terminal.");
+    }
+}
+           
             switchToChatMode(filename) {
                 this.elements.uploadSection.style.display = 'none';
                 this.elements.chatSection.style.display = 'flex';

@@ -10,8 +10,6 @@ os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "false"
 import logging
-from transformers.utils import logging as hf_logging
-hf_logging.set_verbosity_error()
 import base64
 from google import genai
 from google.genai import types
@@ -23,7 +21,7 @@ import time
 import threading
 
 from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.embeddings import FastEmbedEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from langchain_groq import ChatGroq
@@ -56,21 +54,24 @@ if not os.path.exists("static"):
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SESSION / FAISS LIFECYCLE (redesigned for Windows)
+# SESSION / FAISS LIFECYCLE
 #
 # • The FAISS store + retriever live IN MEMORY and are the single source of
-#   truth for /ask. Nothing re-opens the index files per question anymore.
+#   truth for /ask. Nothing re-opens the index files per question.
 # • Every upload is saved to its OWN folder: DB_FAISS_PATH/session_<id>/
 #   A tiny pointer file (ACTIVE_SESSION) records which folder is current so a
 #   server restart can restore it.
 # • Reset is LOGICAL: it clears memory + pointer and always succeeds.
-#   Old folders are removed afterwards, best-effort, in the background, and
-#   retried later if Windows still has a handle on them. The app never
-#   depends on a directory delete succeeding.
+#   Old folders are removed afterwards, best-effort, in the background.
 # ─────────────────────────────────────────────────────────────────────────────
 DB_FAISS_PATH = "vectorstore/db_faiss_v2"
 POINTER_NAME = "ACTIVE_SESSION"
 POINTER_PATH = os.path.join(DB_FAISS_PATH, POINTER_NAME)
+
+# Where the embedding model files are cached (downloaded once on first start)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+EMBED_CACHE_DIR = os.getenv("EMBED_CACHE_DIR", os.path.join(BASE_DIR, "model_cache"))
+EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 pdf_memory = None            # active FAISS vectorstore (in memory)
 active_retriever = None      # active FAISS + BM25 ensemble retriever
@@ -89,11 +90,18 @@ _embeddings_lock = threading.Lock()
 
 
 def get_embeddings():
-    """Single shared embeddings instance (loaded once, reused everywhere)."""
+    """Single shared FastEmbed embeddings instance (loaded once, reused everywhere)."""
     global _embeddings
     with _embeddings_lock:
         if _embeddings is None:
-            _embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+            _embeddings = FastEmbedEmbeddings(
+                model_name=EMBED_MODEL_NAME,
+                cache_dir=EMBED_CACHE_DIR,
+                max_length=256,   # this model truncates at 256 tokens anyway
+                batch_size=16,    # default 256 can spike RAM on large PDFs
+                threads=1,        # avoid spawning one ONNX thread per host core
+            )
+            print("Using FastEmbed (ONNX) embeddings.")
         return _embeddings
 
 
@@ -158,8 +166,7 @@ def purge_stale_sessions():
     """
     Delete every session folder (and legacy index files) that is not the active
     session and not currently being built. Never raises. Returns the number of
-    entries that could not be removed (Windows may still hold them; they are
-    retried later).
+    entries that could not be removed (they are retried later).
     """
     if not purge_lock.acquire(blocking=False):
         return 0
@@ -399,7 +406,7 @@ def process_multimodal_pdf(pdf_path: str):
 
             full_combined_text += f"--- PAGE {page_num} ---\n{text_content}\n{caption}\n\n"
     finally:
-        # Release the Windows file handle on the temp PDF immediately
+        # Release the file handle on the temp PDF immediately
         doc.close()
 
     # ─────────────────────────────────────────────────────────────────────────
