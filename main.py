@@ -1,4 +1,8 @@
 import os
+import sys
+import gc
+import stat
+import uuid
 import shutil
 
 # Suppress HuggingFace and transformers warnings
@@ -51,12 +55,46 @@ if not os.path.exists("static"):
     os.makedirs("static")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SESSION / FAISS LIFECYCLE (redesigned for Windows)
+#
+# • The FAISS store + retriever live IN MEMORY and are the single source of
+#   truth for /ask. Nothing re-opens the index files per question anymore.
+# • Every upload is saved to its OWN folder: DB_FAISS_PATH/session_<id>/
+#   A tiny pointer file (ACTIVE_SESSION) records which folder is current so a
+#   server restart can restore it.
+# • Reset is LOGICAL: it clears memory + pointer and always succeeds.
+#   Old folders are removed afterwards, best-effort, in the background, and
+#   retried later if Windows still has a handle on them. The app never
+#   depends on a directory delete succeeding.
+# ─────────────────────────────────────────────────────────────────────────────
 DB_FAISS_PATH = "vectorstore/db_faiss_v2"
-pdf_memory = None
+POINTER_NAME = "ACTIVE_SESSION"
+POINTER_PATH = os.path.join(DB_FAISS_PATH, POINTER_NAME)
+
+pdf_memory = None            # active FAISS vectorstore (in memory)
+active_retriever = None      # active FAISS + BM25 ensemble retriever
+active_session_name = None   # folder name of the active session on disk
+building_sessions = set()    # session folders currently being written
 conversation_history = []
+
+state_lock = threading.RLock()   # guards the globals above
+purge_lock = threading.Lock()    # only one purge at a time
 
 last_interaction_time = time.time()
 TIMEOUT_SECONDS = 3600  # 1 Hour
+
+_embeddings = None
+_embeddings_lock = threading.Lock()
+
+
+def get_embeddings():
+    """Single shared embeddings instance (loaded once, reused everywhere)."""
+    global _embeddings
+    with _embeddings_lock:
+        if _embeddings is None:
+            _embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        return _embeddings
 
 
 def update_interaction():
@@ -65,26 +103,184 @@ def update_interaction():
     last_interaction_time = time.time()
 
 
+# ───────────────────────── disk helpers (best-effort) ─────────────────────────
+def _on_rm_error(func, path, exc):
+    """Clear read-only flag and retry once; never raise."""
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    except Exception:
+        pass
+
+
+def _safe_rmtree(path):
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_on_rm_error)
+    else:
+        shutil.rmtree(path, onerror=_on_rm_error)
+
+
+def _write_pointer(session_name):
+    """Atomically record which session folder is active."""
+    try:
+        os.makedirs(DB_FAISS_PATH, exist_ok=True)
+        tmp = POINTER_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(session_name)
+        os.replace(tmp, POINTER_PATH)
+    except Exception as e:
+        print(f"Warning: could not write session pointer: {e}")
+
+
+def _clear_pointer():
+    try:
+        if os.path.exists(POINTER_PATH):
+            os.remove(POINTER_PATH)
+    except Exception:
+        try:
+            with open(POINTER_PATH, "w", encoding="utf-8") as f:
+                f.write("")
+        except Exception as e:
+            print(f"Warning: could not clear session pointer: {e}")
+
+
+def _read_pointer():
+    try:
+        if os.path.exists(POINTER_PATH):
+            with open(POINTER_PATH, "r", encoding="utf-8") as f:
+                return f.read().strip()
+    except Exception:
+        pass
+    return ""
+
+
+def purge_stale_sessions():
+    """
+    Delete every session folder (and legacy index files) that is not the active
+    session and not currently being built. Never raises. Returns the number of
+    entries that could not be removed (Windows may still hold them; they are
+    retried later).
+    """
+    if not purge_lock.acquire(blocking=False):
+        return 0
+    leftovers = 0
+    try:
+        if not os.path.isdir(DB_FAISS_PATH):
+            return 0
+
+        with state_lock:
+            keep = set(building_sessions)
+            if active_session_name:
+                keep.add(active_session_name)
+        keep.add(POINTER_NAME)
+
+        for entry in os.listdir(DB_FAISS_PATH):
+            if entry in keep:
+                continue
+            full = os.path.join(DB_FAISS_PATH, entry)
+            try:
+                if os.path.isdir(full):
+                    _safe_rmtree(full)
+                else:
+                    try:
+                        os.chmod(full, stat.S_IWRITE)
+                    except Exception:
+                        pass
+                    os.remove(full)
+            except Exception:
+                pass
+            if os.path.exists(full):
+                leftovers += 1
+        return leftovers
+    except Exception as e:
+        print(f"Purge error (will retry later): {e}")
+        return 0
+    finally:
+        purge_lock.release()
+
+
+def schedule_purge(attempts=5, delay=3):
+    """Run purge in the background, retrying a few times, without blocking requests."""
+    def _run():
+        for _ in range(attempts):
+            if purge_stale_sessions() == 0:
+                return
+            time.sleep(delay)
+    threading.Thread(target=_run, daemon=True).start()
+
+
+# ───────────────────────── in-memory session state ─────────────────────────
+def _build_retriever(vector_db):
+    """Build the FAISS + BM25 ensemble retriever once per session."""
+    # FIX 3: k = 8 on both FAISS and BM25
+    faiss_retriever = vector_db.as_retriever(search_kwargs={"k": 8})
+    docstore_docs = list(vector_db.docstore._dict.values())
+
+    if docstore_docs:
+        bm25_retriever = BM25Retriever.from_documents(docstore_docs)
+        bm25_retriever.k = 8
+        return EnsembleRetriever(
+            retrievers=[faiss_retriever, bm25_retriever],
+            weights=[0.5, 0.5]
+        )
+    return faiss_retriever
+
+
+def _activate_session(vector_db, session_name):
+    """Swap the active session in memory (atomic under the lock)."""
+    global pdf_memory, active_retriever, active_session_name, conversation_history
+    retriever = _build_retriever(vector_db)
+    with state_lock:
+        pdf_memory = vector_db
+        active_retriever = retriever
+        active_session_name = session_name
+        conversation_history = []
+
+
+def _clear_session_state():
+    """Logical reset: drop everything from memory and forget the pointer."""
+    global pdf_memory, active_retriever, active_session_name, conversation_history
+    with state_lock:
+        pdf_memory = None
+        active_retriever = None
+        active_session_name = None
+        conversation_history = []
+    _clear_pointer()
+    gc.collect()
+
+
+def load_active_session_from_disk():
+    """Startup: restore the active session (if any) into memory."""
+    name = _read_pointer()
+    if not name or not name.startswith("session_") or os.sep in name or "/" in name:
+        return False
+    path = os.path.join(DB_FAISS_PATH, name)
+    if not os.path.isdir(path):
+        return False
+    try:
+        vector_db = FAISS.load_local(path, get_embeddings(), allow_dangerous_deserialization=True)
+        _activate_session(vector_db, name)
+        return True
+    except Exception as e:
+        print(f"Failed to load existing vectorstore: {e}")
+        return False
+
+
 def cleanup_loop():
-    """Background thread to delete vectorstore after 1 hour of inactivity."""
-    global pdf_memory, conversation_history, last_interaction_time
+    """Background thread: reset the session after 1 hour of inactivity and purge stale folders."""
     while True:
         time.sleep(60)
-        elapsed = time.time() - last_interaction_time
+        try:
+            elapsed = time.time() - last_interaction_time
 
-        if elapsed > TIMEOUT_SECONDS and os.path.exists(DB_FAISS_PATH):
-            print(f"--- INACTIVITY DETECTED ({elapsed:.0f}s). DELETING VECTORSTORE... ---")
-            try:
-                shutil.rmtree(DB_FAISS_PATH)
-                pdf_memory = None
-                conversation_history = []
+            if elapsed > TIMEOUT_SECONDS and active_retriever is not None:
+                print(f"--- INACTIVITY DETECTED ({elapsed:.0f}s). CLEARING SESSION... ---")
+                _clear_session_state()
                 print("--- CLEANUP COMPLETE ---")
-            except Exception as e:
-                print(f"Error during cleanup: {e}")
 
-
-cleanup_thread = threading.Thread(target=cleanup_loop, daemon=True)
-cleanup_thread.start()
+            purge_stale_sessions()
+        except Exception as e:
+            print(f"Error during cleanup: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -136,14 +332,17 @@ Be extremely specific about positions and relationships. Do not omit any labeled
         return "[Image caption failed]"
 
 
-if os.path.exists(DB_FAISS_PATH):
-    print("Found existing vectorstore. Loading...")
-    try:
-        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-        pdf_memory = FAISS.load_local(DB_FAISS_PATH, embeddings, allow_dangerous_deserialization=True)
+# ───────────────────────────── startup ─────────────────────────────
+if os.path.isdir(DB_FAISS_PATH):
+    print("Found existing vectorstore folder. Restoring active session...")
+    if load_active_session_from_disk():
         print("Vectorstore loaded successfully.")
-    except Exception as e:
-        print(f"Failed to load existing vectorstore: {e}")
+    else:
+        print("No active session to restore.")
+    schedule_purge()  # remove legacy / stale folders in the background
+
+cleanup_thread = threading.Thread(target=cleanup_loop, daemon=True)
+cleanup_thread.start()
 
 
 def process_multimodal_pdf(pdf_path: str):
@@ -163,41 +362,45 @@ def process_multimodal_pdf(pdf_path: str):
     doc = fitz.open(pdf_path)
     full_combined_text = ""
 
-    for page_index in range(len(doc)):
-        page = doc[page_index]
-        page_num = page_index + 1
+    try:
+        for page_index in range(len(doc)):
+            page = doc[page_index]
+            page_num = page_index + 1
 
-        images = page.get_images(full=True)
-        drawings = page.get_drawings()
-        has_visuals = len(images) > 0 or len(drawings) > 0
+            images = page.get_images(full=True)
+            drawings = page.get_drawings()
+            has_visuals = len(images) > 0 or len(drawings) > 0
 
-        caption = ""
+            caption = ""
 
-        if has_visuals:
-            print(f"Visuals found on Page {page_num}. Rendering page...")
-            try:
-                time.sleep(2.5)
+            if has_visuals:
+                print(f"Visuals found on Page {page_num}. Rendering page...")
+                try:
+                    time.sleep(2.5)
 
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                img_bytes = pix.tobytes("png")
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                    img_bytes = pix.tobytes("png")
 
-                caption = summarize_image(img_bytes)
+                    caption = summarize_image(img_bytes)
 
-                if "429" in caption or "quota" in caption.lower():
-                    print(f"Skipping Page {page_num} due to Rate Limit.")
+                    if "429" in caption or "quota" in caption.lower():
+                        print(f"Skipping Page {page_num} due to Rate Limit.")
+                        caption = ""
+                    else:
+                        caption = f"\n\n[VISUAL ANALYSIS OF PAGE {page_num}]\n{caption}\n[END VISUAL ANALYSIS]\n"
+
+                except Exception as e:
+                    print(f"Visual Analysis Failed for Page {page_num}: {e}")
                     caption = ""
-                else:
-                    caption = f"\n\n[VISUAL ANALYSIS OF PAGE {page_num}]\n{caption}\n[END VISUAL ANALYSIS]\n"
 
-            except Exception as e:
-                print(f"Visual Analysis Failed for Page {page_num}: {e}")
-                caption = ""
+            text_content = ""
+            if page_index < len(parsed_docs):
+                text_content = parsed_docs[page_index].text
 
-        text_content = ""
-        if page_index < len(parsed_docs):
-            text_content = parsed_docs[page_index].text
-
-        full_combined_text += f"--- PAGE {page_num} ---\n{text_content}\n{caption}\n\n"
+            full_combined_text += f"--- PAGE {page_num} ---\n{text_content}\n{caption}\n\n"
+    finally:
+        # Release the Windows file handle on the temp PDF immediately
+        doc.close()
 
     # ─────────────────────────────────────────────────────────────────────────
     # FIX 2: Larger chunk size so [VISUAL ANALYSIS] blocks are NOT split across
@@ -211,52 +414,52 @@ def process_multimodal_pdf(pdf_path: str):
     chunks = splitter.split_text(full_combined_text)
 
     documents = [Document(page_content=chunk, metadata={"source": pdf_path}) for chunk in chunks]
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    embeddings = get_embeddings()
 
-    global pdf_memory
-    pdf_memory = FAISS.from_documents(documents, embeddings)
-    pdf_memory.save_local(DB_FAISS_PATH)
+    # Build the new index in memory, save it to its OWN folder, then swap it in.
+    new_store = FAISS.from_documents(documents, embeddings)
+
+    session_name = f"session_{uuid.uuid4().hex[:12]}"
+    session_path = os.path.join(DB_FAISS_PATH, session_name)
+
+    with state_lock:
+        building_sessions.add(session_name)
+    try:
+        os.makedirs(DB_FAISS_PATH, exist_ok=True)
+        new_store.save_local(session_path)
+        _write_pointer(session_name)
+        _activate_session(new_store, session_name)
+    finally:
+        with state_lock:
+            building_sessions.discard(session_name)
+
+    # The previous document's folder is now stale — remove it in the background.
+    schedule_purge()
 
     print(f"--- INGESTION COMPLETE: {len(chunks)} chunks stored. ---")
     return len(chunks)
 
 
 def get_ai_response(query: str):
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    global conversation_history
 
-    try:
-        vector_db = FAISS.load_local(DB_FAISS_PATH, embeddings, allow_dangerous_deserialization=True)
-    except:
+    # Use the in-memory retriever — no per-question disk loading.
+    with state_lock:
+        retriever_to_use = active_retriever
+        history_snapshot = list(conversation_history[-5:])
+
+    if retriever_to_use is None:
         return "System Error: Please re-upload the PDF to initialize the database."
 
-    llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.1)
+    llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.1)
 
-    global conversation_history
     clean_history = []
-    for msg in conversation_history[-5:]:
+    for msg in history_snapshot:
         role = msg['role']
         content = msg['content'].replace("{", "(").replace("}", ")")
         clean_history.append(f"{role}: {content}")
 
     history_str = "\n".join(clean_history)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # FIX 3: Increased retriever k from 5 → 8 on both FAISS and BM25 so more
-    #         relevant chunks (including visual analysis blocks) are surfaced.
-    # ─────────────────────────────────────────────────────────────────────────
-    faiss_retriever = vector_db.as_retriever(search_kwargs={"k": 8})
-    docstore_docs = list(vector_db.docstore._dict.values())
-
-    if docstore_docs:
-        bm25_retriever = BM25Retriever.from_documents(docstore_docs)
-        bm25_retriever.k = 8
-        ensemble_retriever = EnsembleRetriever(
-            retrievers=[faiss_retriever, bm25_retriever],
-            weights=[0.5, 0.5]
-        )
-        retriever_to_use = ensemble_retriever
-    else:
-        retriever_to_use = faiss_retriever
 
     # ─────────────────────────────────────────────────────────────────────────
     # FIX 4: Improved prompt — now explicitly instructs the LLM to:
@@ -305,43 +508,60 @@ def get_ai_response(query: str):
     response = retrieval_chain.invoke({"input": query})
     answer = response["answer"]
 
-    conversation_history.append({"role": "User", "content": query})
-    conversation_history.append({"role": "AI", "content": answer})
+    with state_lock:
+        # Only record history if the session wasn't reset/replaced mid-question
+        if active_retriever is retriever_to_use:
+            conversation_history.append({"role": "User", "content": query})
+            conversation_history.append({"role": "AI", "content": answer})
 
     return answer
 
 
 @app.post("/reset-session")
 async def reset_session():
-    """Clears the current vectorstore and history to allow a new upload."""
-    global pdf_memory, conversation_history, last_interaction_time
+    """Logically resets the session. Never depends on a directory delete succeeding."""
+    try:
+        print("--- RESETTING SESSION ---")
 
-    pdf_memory = None
-    conversation_history = []
+        # 1. Drop all in-memory state (store, retriever, history) and the pointer.
+        _clear_session_state()
 
-    if os.path.exists(DB_FAISS_PATH):
-        try:
-            shutil.rmtree(DB_FAISS_PATH)
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        # 2. Delete old folders in the background, best-effort (retried if locked).
+        schedule_purge()
 
-    return {"success": True}
+        update_interaction()
+
+        print("--- SESSION RESET COMPLETE ---")
+
+        return {
+            "success": True,
+            "message": "Session reset successfully."
+        }
+
+    except Exception as e:
+        print(f"--- RESET ERROR: {e} ---")
+
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 
 @app.get("/check-session")
 async def check_session():
-    """Returns True if the vectorstore exists, telling UI to skip upload."""
+    """Returns True if a document session is active, telling UI to skip upload."""
     update_interaction()
-    if os.path.exists(DB_FAISS_PATH):
-        return {"ready": True}
-    return {"ready": False}
+    with state_lock:
+        ready = active_retriever is not None
+    return {"ready": ready}
 
 
 @app.post("/upload-pdf")
 async def upload_pdf(file: UploadFile = File(...)):
     update_interaction()
     global conversation_history
-    conversation_history = []
+    with state_lock:
+        conversation_history = []
 
     if not file.filename.lower().endswith(".pdf"):
         return {"success": False, "error": "Invalid file type."}
@@ -351,18 +571,24 @@ async def upload_pdf(file: UploadFile = File(...)):
         with open(temp_filename, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
         num_chunks = process_multimodal_pdf(temp_filename)
+        update_interaction()
         return {"success": True, "chunks": num_chunks}
     except Exception as e:
         return {"success": False, "error": str(e)}
     finally:
-        if os.path.exists(temp_filename):
-            os.remove(temp_filename)
+        try:
+            if os.path.exists(temp_filename):
+                os.remove(temp_filename)
+        except Exception as e:
+            print(f"Could not remove temp file {temp_filename}: {e}")
 
 
 @app.post("/ask")
 async def ask(question: str = Form(...)):
     update_interaction()
-    if not os.path.exists(DB_FAISS_PATH):
+    with state_lock:
+        has_session = active_retriever is not None
+    if not has_session:
         return {"success": False, "result": "Please upload a PDF first."}
     return {"success": True, "result": get_ai_response(question)}
 
